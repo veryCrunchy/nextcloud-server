@@ -70,7 +70,7 @@ class GroupsControllerTest extends \Test\TestCase {
 				$this->subAdminManager,
 				$this->l10nFactory,
 				$this->rootFolder,
-				$this->logger
+				$this->logger,
 			])
 			->onlyMethods(['fillStorageInfo'])
 			->getMock();

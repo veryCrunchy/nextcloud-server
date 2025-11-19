@@ -347,6 +347,17 @@ const getters = {
 const CancelToken = axios.CancelToken
 let searchRequestCancelSource = null
 
+function commitGroupsFromUsersResponse(context, response) {
+	const groups = response.data.ocs.data.groups ?? []
+	if (groups.length === 0) {
+		return
+	}
+
+	groups.forEach((group) => {
+		context.commit('addGroup', { id: group.id, name: group.name })
+	})
+}
+
 const actions = {
 
 	/**
@@ -411,6 +422,7 @@ const actions = {
 					if (usersCount > 0) {
 						context.commit('appendUsers', response.data.ocs.data.users)
 					}
+					commitGroupsFromUsersResponse(context, response)
 					return usersCount
 				})
 				.catch((error) => {
@@ -428,6 +440,7 @@ const actions = {
 				if (usersCount > 0) {
 					context.commit('appendUsers', response.data.ocs.data.users)
 				}
+				commitGroupsFromUsersResponse(context, response)
 				return usersCount
 			})
 			.catch((error) => {
@@ -491,8 +504,9 @@ const actions = {
 		const limitParam = limit === -1 ? '' : `&limit=${limit}`
 		return api.get(generateOcsUrl('cloud/groups?offset={offset}&search={search}', { offset, search }) + limitParam)
 			.then((response) => {
-				if (Object.keys(response.data.ocs.data.groups).length > 0) {
-					response.data.ocs.data.groups.forEach(function(group) {
+				const groups = response.data.ocs.data.groups ?? []
+				if (groups.length > 0) {
+					groups.forEach(function(group) {
 						context.commit('addGroup', { id: group, name: group })
 					})
 					return true
