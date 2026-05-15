@@ -1,24 +1,25 @@
 <?php
 
+declare(strict_types=1);
+
 /**
- * SPDX-FileCopyrightText: 2016-2024 Nextcloud GmbH and Nextcloud contributors
- * SPDX-FileCopyrightText: 2016 ownCloud, Inc.
- * SPDX-License-Identifier: AGPL-3.0-only
+ * SPDX-FileCopyrightText: 2026 Nextcloud GmbH and Nextcloud contributors
+ * SPDX-License-Identifier: AGPL-3.0-or-later
  */
 
 namespace OC\Memcache;
 
-use OC\RedisFactory;
 use OCP\IMemcacheTTL;
 use OCP\Server;
+use Predis\Client;
+use Predis\Connection\Cluster\ClusterInterface;
+use Predis\Response\ServerException;
 
 /**
- * @deprecated 34.0.0 Legacy phpredis based backend. Kept so existing `redis`
- *             and `redis.cluster` configurations keep working. New setups should
- *             use {@see KeyValueCache} with the `memcache.kvstore` configuration,
- *             which also supports Valkey.
+ * Brand-independent key-value store cache backend (e.g. Valkey or Redis)
+ * implemented on top of the predis library.
  */
-class Redis extends Cache implements IMemcacheTTL {
+class KeyValueCache extends Cache implements IMemcacheTTL {
 	/** name => [script, sha1] */
 	public const LUA_SCRIPTS = [
 		'dec' => [
@@ -45,18 +46,11 @@ class Redis extends Cache implements IMemcacheTTL {
 
 	private const MAX_TTL = 30 * 24 * 60 * 60; // 1 month
 
-	private \Redis|\RedisCluster|null $cache = null;
+	private ?Client $cache = null;
 
-	public function __construct($prefix = '', string $logFile = '') {
-		parent::__construct($prefix);
-	}
-
-	/**
-	 * @throws \Exception
-	 */
-	public function getCache(): \Redis|\RedisCluster {
+	public function getCache(): Client {
 		if ($this->cache === null) {
-			$this->cache = \OCP\Server::get(RedisFactory::class)->getInstance();
+			$this->cache = Server::get(KeyValueCacheFactory::class)->getInstance();
 		}
 		return $this->cache;
 	}
@@ -64,7 +58,7 @@ class Redis extends Cache implements IMemcacheTTL {
 	#[\Override]
 	public function get($key) {
 		$result = $this->getCache()->get($this->getPrefix() . $key);
-		if ($result === false) {
+		if ($result === null) {
 			return null;
 		}
 
@@ -74,12 +68,8 @@ class Redis extends Cache implements IMemcacheTTL {
 	#[\Override]
 	public function set($key, $value, $ttl = 0) {
 		$value = self::encodeValue($value);
-		if ($ttl === 0) {
-			// having infinite TTL can lead to leaked keys as the prefix changes with version upgrades
-			$ttl = self::DEFAULT_TTL;
-		}
-		$ttl = min($ttl, self::MAX_TTL);
-		return $this->getCache()->setex($this->getPrefix() . $key, $ttl, $value);
+		$ttl = $this->normalizeTtl($ttl);
+		return (bool)$this->getCache()->setex($this->getPrefix() . $key, $ttl, $value);
 	}
 
 	#[\Override]
@@ -89,21 +79,47 @@ class Redis extends Cache implements IMemcacheTTL {
 
 	#[\Override]
 	public function remove($key) {
-		if ($this->getCache()->unlink($this->getPrefix() . $key)) {
-			return true;
-		} else {
-			return false;
-		}
+		return (bool)$this->getCache()->del($this->getPrefix() . $key);
 	}
 
 	#[\Override]
 	public function clear($prefix = '') {
-		// TODO: this is slow and would fail with Redis cluster
-		$prefix = $this->getPrefix() . $prefix . '*';
-		$keys = $this->getCache()->keys($prefix);
-		$deleted = $this->getCache()->del($keys);
+		$pattern = $this->getPrefix() . $prefix . '*';
+		$client = $this->getCache();
 
-		return (is_array($keys) && (count($keys) === $deleted));
+		// On a cluster the key space is spread across the nodes, so we have to
+		// scan every node individually. Other topologies route writes to the
+		// primary on their own.
+		if ($client->getConnection() instanceof ClusterInterface) {
+			$success = true;
+			/** @var Client $node */
+			foreach ($client as $node) {
+				// Keys of a single node can still span multiple hash slots, so
+				// delete them individually to avoid CROSSSLOT errors.
+				$success = $this->clearNode($node, $pattern, true) && $success;
+			}
+			return $success;
+		}
+
+		return $this->clearNode($client, $pattern, false);
+	}
+
+	private function clearNode(Client $node, string $pattern, bool $perKey): bool {
+		$keys = $node->keys($pattern);
+		if ($keys === []) {
+			return true;
+		}
+
+		if ($perKey) {
+			$deleted = 0;
+			foreach ($keys as $key) {
+				$deleted += $node->del($key);
+			}
+		} else {
+			$deleted = $node->del($keys);
+		}
+
+		return count($keys) === $deleted;
 	}
 
 	/**
@@ -117,16 +133,9 @@ class Redis extends Cache implements IMemcacheTTL {
 	#[\Override]
 	public function add($key, $value, $ttl = 0) {
 		$value = self::encodeValue($value);
-		if ($ttl === 0) {
-			// having infinite TTL can lead to leaked keys as the prefix changes with version upgrades
-			$ttl = self::DEFAULT_TTL;
-		}
-		$ttl = min($ttl, self::MAX_TTL);
+		$ttl = $this->normalizeTtl($ttl);
 
-		$args = ['nx'];
-		$args['ex'] = $ttl;
-
-		return $this->getCache()->set($this->getPrefix() . $key, $value, $args);
+		return $this->getCache()->set($this->getPrefix() . $key, $value, 'EX', $ttl, 'NX') !== null;
 	}
 
 	/**
@@ -134,11 +143,16 @@ class Redis extends Cache implements IMemcacheTTL {
 	 *
 	 * @param string $key
 	 * @param int $step
-	 * @return int | bool
+	 * @return int|bool
 	 */
 	#[\Override]
 	public function inc($key, $step = 1) {
-		return $this->getCache()->incrBy($this->getPrefix() . $key, $step);
+		try {
+			return $this->getCache()->incrby($this->getPrefix() . $key, $step);
+		} catch (ServerException) {
+			// The stored value is not an integer
+			return false;
+		}
 	}
 
 	/**
@@ -146,11 +160,16 @@ class Redis extends Cache implements IMemcacheTTL {
 	 *
 	 * @param string $key
 	 * @param int $step
-	 * @return int | bool
+	 * @return int|bool
 	 */
 	#[\Override]
 	public function dec($key, $step = 1) {
-		$res = $this->evalLua('dec', [$key], [$step]);
+		try {
+			$res = $this->evalLua('dec', [$key], [$step]);
+		} catch (ServerException) {
+			// The stored value is not an integer
+			return false;
+		}
 		return ($res === 'NEX') ? false : $res;
 	}
 
@@ -193,11 +212,7 @@ class Redis extends Cache implements IMemcacheTTL {
 
 	#[\Override]
 	public function setTTL($key, $ttl) {
-		if ($ttl === 0) {
-			// having infinite TTL can lead to leaked keys as the prefix changes with version upgrades
-			$ttl = self::DEFAULT_TTL;
-		}
-		$ttl = min($ttl, self::MAX_TTL);
+		$ttl = $this->normalizeTtl($ttl);
 		$this->getCache()->expire($this->getPrefix() . $key, $ttl);
 	}
 
@@ -216,24 +231,39 @@ class Redis extends Cache implements IMemcacheTTL {
 
 	#[\Override]
 	public static function isAvailable(): bool {
-		return Server::get(RedisFactory::class)->isAvailable();
+		return Server::get(KeyValueCacheFactory::class)->isAvailable();
 	}
 
 	protected function evalLua(string $scriptName, array $keys, array $args) {
 		$keys = array_map(fn ($key) => $this->getPrefix() . $key, $keys);
-		$args = array_merge($keys, $args);
+		$numKeys = count($keys);
+		$arguments = array_merge($keys, $args);
 		$script = self::LUA_SCRIPTS[$scriptName];
 
-		$result = $this->getCache()->evalSha($script[1], $args, count($keys));
-		if ($result === false) {
-			$result = $this->getCache()->eval($script[0], $args, count($keys));
+		try {
+			return $this->getCache()->evalsha($script[1], $numKeys, ...$arguments);
+		} catch (ServerException $e) {
+			// The script is not cached on the server yet, send the full body
+			if ($e->getErrorType() === 'NOSCRIPT') {
+				return $this->getCache()->eval($script[0], $numKeys, ...$arguments);
+			}
+			throw $e;
 		}
+	}
 
-		return $result;
+	/**
+	 * An infinite TTL can leak keys as the prefix changes with version upgrades,
+	 * so fall back to the default and cap it to the maximum.
+	 */
+	private function normalizeTtl(int $ttl): int {
+		if ($ttl === 0) {
+			$ttl = self::DEFAULT_TTL;
+		}
+		return min($ttl, self::MAX_TTL);
 	}
 
 	protected static function encodeValue(mixed $value): string {
-		return is_int($value) ? (string)$value : json_encode($value);
+		return is_int($value) ? (string)$value : json_encode($value, JSON_THROW_ON_ERROR);
 	}
 
 	protected static function decodeValue(string $value): mixed {
