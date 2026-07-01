@@ -85,7 +85,7 @@ class UsersController extends AUserDataOCSController {
 		private IPhoneNumberUtil $phoneNumberUtil,
 		private IAppManager $appManager,
 		private IAppConfig $appConfig,
-		protected GroupDisplayNameCache $groupDisplayNameCache,
+		GroupDisplayNameCache $groupDisplayNameCache,
 	) {
 		parent::__construct(
 			$appName,
@@ -98,6 +98,7 @@ class UsersController extends AUserDataOCSController {
 			$subAdminManager,
 			$l10nFactory,
 			$rootFolder,
+			$groupDisplayNameCache,
 		);
 
 		$this->l10n = $l10nFactory->get($appName);
@@ -206,30 +207,6 @@ class UsersController extends AUserDataOCSController {
 			'users' => $usersDetails,
 			'groups' => $this->findGroupsWithDisplayname($usersDetails),
 		]);
-	}
-
-	/**
-	 * @return list<Provisioning_APIUserDetailsGroupDisplayname>
-	 */
-	private function findGroupsWithDisplayname(array $userDetails): array {
-		$groupIds = [];
-
-		foreach ($userDetails as $userDetail) {
-			if (isset($userDetail['groups'])) {
-				array_push($groupIds, ...array_values($userDetail['groups']));
-			}
-			if (isset($userDetail['subadmin'])) {
-				array_push($groupIds, ...array_values($userDetail['subadmin']));
-			}
-		}
-
-		$groupIds = array_unique($groupIds);
-		sort($groupIds);
-
-		return array_map(function ($groupId) {
-			$displayname = $this->groupDisplayNameCache->getDisplayName($groupId) ?? $groupId;
-			return ['id' => $groupId, 'displayname' => $displayname];
-		}, $groupIds);
 	}
 
 	/**
