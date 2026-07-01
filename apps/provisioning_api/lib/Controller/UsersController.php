@@ -228,7 +228,7 @@ class UsersController extends AUserDataOCSController {
 
 		return array_map(function ($groupId) {
 			$displayname = $this->groupDisplayNameCache->getDisplayName($groupId) ?? $groupId;
-			return ['id' => $groupId, 'name' => $displayname];
+			return ['id' => $groupId, 'displayname' => $displayname];
 		}, $groupIds);
 	}
 

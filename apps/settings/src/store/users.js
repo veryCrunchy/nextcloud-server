@@ -354,7 +354,7 @@ function commitGroupsFromUsersResponse(context, response) {
 	}
 
 	groups.forEach((group) => {
-		context.commit('addGroup', { id: group.id, name: group.name })
+		context.commit('addGroup', { id: group.id, name: group.displayname })
 	})
 }
 
